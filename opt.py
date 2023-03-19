@@ -7,7 +7,7 @@ def get_opts():
     parser.add_argument('--root_dir', type=str, required=True,
                         help='root directory of dataset')
     parser.add_argument('--dataset_name', type=str, default='nsvf',
-                        choices=['nerf', 'nsvf', 'colmap', 'nerfpp', 'rtmv'],
+                        choices=['nerf', 'nsvf', 'colmap', 'nerfpp', 'rtmv','brics'],
                         help='which dataset to train/test')
     parser.add_argument('--split', type=str, default='train',
                         choices=['train', 'trainval', 'trainvaltest'],
@@ -66,5 +66,13 @@ def get_opts():
                         help='pretrained checkpoint to load (including optimizers, etc)')
     parser.add_argument('--weight_path', type=str, default=None,
                         help='pretrained checkpoint to load (excluding optimizers, etc)')
+                        
+    # canonial rendering
+    
+    parser.add_argument('--render_only', action='store_true', default=False,
+                        help='to render the canonial videos')
+    parser.add_argument('--output_dir', type=str, default="/home2/anish.gupta/ngp_pl/dd/",
+                        help='root directory of dataset')
+    
 
     return parser.parse_args()

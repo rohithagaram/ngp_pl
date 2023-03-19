@@ -11,7 +11,7 @@ from einops import rearrange
 # data
 from torch.utils.data import DataLoader
 from datasets import dataset_dict
-from datasets.ray_utils import axisangle_to_R, get_rays
+from datasets.ray_utils import axisangle_to_R, get_rays ,   get_ray_directions
 
 # models
 from kornia.utils.grid import create_meshgrid3d
@@ -69,6 +69,10 @@ class NeRFSystem(LightningModule):
 
         rgb_act = 'None' if self.hparams.use_exposure else 'Sigmoid'
         self.model = NGP(scale=self.hparams.scale, rgb_act=rgb_act)
+        
+        if hparams.render_only:
+            load_ckpt(self.model, hparams.ckpt_path)
+            
         G = self.model.grid_size
         self.model.register_buffer('density_grid',
             torch.zeros(self.model.cascades, G**3))
@@ -76,6 +80,7 @@ class NeRFSystem(LightningModule):
             create_meshgrid3d(G, G, G, False, dtype=torch.int32).reshape(-1, 3))
 
     def forward(self, batch, split):
+        
         if split=='train':
             poses = self.poses[batch['img_idxs']]
             directions = self.directions[batch['pix_idxs']]
@@ -103,6 +108,7 @@ class NeRFSystem(LightningModule):
         dataset = dataset_dict[self.hparams.dataset_name]
         kwargs = {'root_dir': self.hparams.root_dir,
                   'downsample': self.hparams.downsample}
+        
         self.train_dataset = dataset(split=self.hparams.split, **kwargs)
         self.train_dataset.batch_size = self.hparams.batch_size
         self.train_dataset.ray_sampling_strategy = self.hparams.ray_sampling_strategy
@@ -241,7 +247,47 @@ class NeRFSystem(LightningModule):
         items = super().get_progress_bar_dict()
         items.pop("v_num", None)
         return items
-
+    
+    def canonical_render_path(self,hparams):
+        val_dir = hparams.output_dir
+        with torch.no_grad():
+            dataset = dataset_dict[self.hparams.dataset_name]
+            kwargs = {'root_dir': self.hparams.root_dir,
+                      'downsample': self.hparams.downsample}
+            self.test_dataset = dataset(split='test', **kwargs)
+            poses = self.test_dataset.all_poses
+            #poses = self.test_dataset.render_poses
+            K = self.test_dataset.K
+            W,H = self.test_dataset.img_wh
+            directions = directions = get_ray_directions(H, W, K , device='cuda')
+            self.model.center = self.model.center.to(directions.device)
+            self.model.half_size = self.model.half_size.to(directions.device)
+            self.model.density_bitfield = self.model.density_bitfield.to(directions.device)
+            self.model.xyz_min = self.model.xyz_min.to(directions.device)
+            self.model.xyz_max = self.model.xyz_max.to(directions.device)
+            
+            for idx in range(poses.shape[0]):
+                rays_o, rays_d = get_rays(directions,torch.from_numpy(poses[idx]).type(torch.float32).to(directions.device))
+                kwargs = {'test_time': True,
+                          'random_bg': self.hparams.random_bg}
+                if self.hparams.scale > 0.5:
+                    kwargs['exp_step_factor'] = 1/256
+                if self.hparams.use_exposure:
+                    kwargs['exposure'] = batch['exposure']
+                results =  render(self.model, rays_o, rays_d, **kwargs)
+                w, h = self.test_dataset.img_wh
+                rgb_pred = rearrange(results['rgb'].cpu().numpy(), '(h w) c -> h w c', h=h)
+                rgb_pred = (rgb_pred*255).astype(np.uint8)
+                depth = depth2img(rearrange(results['depth'].cpu().numpy(), '(h w) -> h w', h=h))
+                imageio.imsave(os.path.join(val_dir, f'{idx:03d}.png'), rgb_pred)
+                #imageio.imsave(os.path.join(val_dir, f'{idx:03d}_d.png'), depth)
+                
+            imgs = sorted(glob.glob(os.path.join(val_dir, '*.png')))
+            imageio.mimsave(os.path.join(val_dir, 'rgb.mp4'),
+                            [imageio.imread(img) for img in imgs[::2]],
+                            fps=30, macro_block_size=1)
+            
+        
 
 if __name__ == '__main__':
     hparams = get_opts()
@@ -260,34 +306,36 @@ if __name__ == '__main__':
     logger = TensorBoardLogger(save_dir=f"logs/{hparams.dataset_name}",
                                name=hparams.exp_name,
                                default_hp_metric=False)
+    if (not hparams.render_only): 
+        trainer = Trainer(max_epochs=hparams.num_epochs,
+                          check_val_every_n_epoch=hparams.num_epochs,
+                          callbacks=callbacks,
+                          logger=logger,
+                          enable_model_summary=False,
+                          accelerator='gpu',
+                          devices=hparams.num_gpus,
+                          strategy=DDPPlugin(find_unused_parameters=False)
+                                   if hparams.num_gpus>1 else None,
+                          num_sanity_val_steps=-1 if hparams.val_only else 0,
+                          precision=16)
 
-    trainer = Trainer(max_epochs=hparams.num_epochs,
-                      check_val_every_n_epoch=hparams.num_epochs,
-                      callbacks=callbacks,
-                      logger=logger,
-                      enable_model_summary=False,
-                      accelerator='gpu',
-                      devices=hparams.num_gpus,
-                      strategy=DDPPlugin(find_unused_parameters=False)
-                               if hparams.num_gpus>1 else None,
-                      num_sanity_val_steps=-1 if hparams.val_only else 0,
-                      precision=16)
+        trainer.fit(system, ckpt_path=hparams.ckpt_path)
 
-    trainer.fit(system, ckpt_path=hparams.ckpt_path)
+        if not hparams.val_only: # save slimmed ckpt for the last epoch
+            ckpt_ = \
+                slim_ckpt(f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}.ckpt',
+                          save_poses=hparams.optimize_ext)
+            torch.save(ckpt_, f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
 
-    if not hparams.val_only: # save slimmed ckpt for the last epoch
-        ckpt_ = \
-            slim_ckpt(f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}.ckpt',
-                      save_poses=hparams.optimize_ext)
-        torch.save(ckpt_, f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
-
-    if (not hparams.no_save_test) and \
-       hparams.dataset_name=='nsvf' and \
-       'Synthetic' in hparams.root_dir: # save video
-        imgs = sorted(glob.glob(os.path.join(system.val_dir, '*.png')))
-        imageio.mimsave(os.path.join(system.val_dir, 'rgb.mp4'),
-                        [imageio.imread(img) for img in imgs[::2]],
-                        fps=30, macro_block_size=1)
-        imageio.mimsave(os.path.join(system.val_dir, 'depth.mp4'),
-                        [imageio.imread(img) for img in imgs[1::2]],
-                        fps=30, macro_block_size=1)
+        if (not hparams.no_save_test) and \
+           hparams.dataset_name=='nsvf' and \
+           'Synthetic' in hparams.root_dir: # save video
+            imgs = sorted(glob.glob(os.path.join(system.val_dir, '*.png')))
+            imageio.mimsave(os.path.join(system.val_dir, 'rgb.mp4'),
+                            [imageio.imread(img) for img in imgs[::2]],
+                            fps=30, macro_block_size=1)
+            imageio.mimsave(os.path.join(system.val_dir, 'depth.mp4'),
+                            [imageio.imread(img) for img in imgs[1::2]],
+                            fps=30, macro_block_size=1)
+    else:
+        system.canonical_render_path(hparams)
